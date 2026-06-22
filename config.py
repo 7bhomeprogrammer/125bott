@@ -2,7 +2,7 @@ import os
 import secrets
 
 BOT_TOKEN = "8903142933:AAEHtd2rd8eTEk5ULzaIgOAwoZ34MbC3ftg"
-MAIN_ADMIN_ID =  8766579960
+MAIN_ADMIN_ID =  8487320282
 DB_PATH = os.path.join(os.path.dirname(__file__), "debts_kaa.db")
 SECRET_KEY = secrets.token_hex(24)
 
