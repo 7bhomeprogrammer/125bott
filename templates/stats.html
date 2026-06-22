@@ -60,8 +60,14 @@
                             {% for user in debtors %}
                             <tr class="debtor-row">
                                 <td>
+                                    {% if user['username'] and user['username'] not in ['NoUsername', 'user'] %}
+                                    <div class="fw-bold name-field">@{{ user['username'] }}</div>
+                                    {% if user['full_name'] and not user['full_name'].startswith('Клиент_') %}
+                                    <small class="text-muted">{{ user['full_name'] }}</small>
+                                    {% endif %}
+                                    {% else %}
                                     <div class="fw-bold name-field">{{ user['full_name'] }}</div>
-                                    <small class="text-muted">@{{ user['username'] }}</small>
+                                    {% endif %}
                                 </td>
                                 <td class="text-danger fw-bold text-end text-nowrap">{{ user['total_debt'] }} сум</td>
                             </tr>

@@ -33,6 +33,29 @@ async def get_txt(user_id: int, key: str, *args):
     text = MESSAGES.get(lang, MESSAGES['kaa']).get(key, "")
     return text.format(*args) if args else text
 
+async def refresh_user_from_telegram(bot: Bot, user_id: int):
+    user = await db.get_user_by_id(user_id)
+    if user and not db.needs_profile_refresh(user):
+        return user
+    try:
+        chat = await bot.get_chat(user_id)
+        await db.upsert_user(
+            user_id,
+            chat.username or "NoUsername",
+            chat.full_name or chat.first_name or ""
+        )
+    except Exception:
+        pass
+    return await db.get_user_by_id(user_id)
+
+async def refresh_users_list(bot: Bot, users: list):
+    refreshed = []
+    for user in users:
+        if db.needs_profile_refresh(user):
+            user = await refresh_user_from_telegram(bot, user['id']) or user
+        refreshed.append(user)
+    return refreshed
+
 def get_main_menu(user_id, is_seller=False):
     if user_id == MAIN_ADMIN_ID:
         return ReplyKeyboardMarkup(keyboard=[
@@ -55,8 +78,19 @@ def get_settings_keyboard():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="➕ Сатыушы (Админ) қосыў", request_user=KeyboardButtonRequestUser(request_id=1, user_is_bot=False))],
         [KeyboardButton(text="❌ Сатыушыны (Админ) өшириў")],
+        [KeyboardButton(text="🗑 Қарзы жоқ клиентлер")],
         [KeyboardButton(text="⬅️ Бас менюге қайтыў")]
     ], resize_keyboard=True)
+
+def get_client_menu_keyboard(client: dict, viewer_id: int):
+    buttons = [
+        [KeyboardButton(text="🛍 Товар бериў"), KeyboardButton(text="💰 Қарзын қайтарыў")],
+        [KeyboardButton(text="📊 Қарз тарыхын көриў")],
+    ]
+    if viewer_id == MAIN_ADMIN_ID and client['total_debt'] <= 0:
+        buttons.append([KeyboardButton(text="🗑 Клиентти өшириў")])
+    buttons.append([KeyboardButton(text="⬅️ Бас менюге қайтыў")])
+    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
 def get_lang_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -64,11 +98,14 @@ def get_lang_keyboard():
         [InlineKeyboardButton(text="🇷🇺 Русский", callback_data="setlang_ru")]
     ])
 
-async def get_clients_pagination_keyboard(page: int = 1, search_query: str = None):
+async def get_clients_pagination_keyboard(page: int = 1, search_query: str = None, bot: Bot = None):
     if search_query:
         users = await db.search_users_by_name(search_query)
     else:
-        users = await db.search_users_by_name("") 
+        users = await db.search_users_by_name("")
+    
+    if bot:
+        users = await refresh_users_list(bot, users)
     
     if not users:
         return None, 0
@@ -80,7 +117,8 @@ async def get_clients_pagination_keyboard(page: int = 1, search_query: str = Non
 
     inline_kbd = []
     for u in page_users:
-        inline_kbd.append([InlineKeyboardButton(text=f"{u['full_name']} ({u['total_debt']} сум)", callback_data=f"cli_{u['id']}")])
+        display_name = db.get_client_display_name(u)
+        inline_kbd.append([InlineKeyboardButton(text=f"{display_name} ({u['total_debt']} сум)", callback_data=f"cli_{u['id']}")])
 
     nav_buttons = []
     if page > 1:
@@ -180,76 +218,180 @@ async def process_delete_seller(callback: CallbackQuery):
     await callback.message.answer("🗑 Админлик ҳуқықы табыслы алып тасланды!")
     await callback.answer()
 
+@router.message(F.text == "🗑 Қарзы жоқ клиентлер")
+async def start_cleanup_zero_debt_clients(message: Message, bot: Bot):
+    if message.from_user.id != MAIN_ADMIN_ID: return
+    clients = await db.get_zero_debt_clients()
+    clients = await refresh_users_list(bot, clients)
+    if not clients:
+        await message.answer(await get_txt(message.from_user.id, 'zero_debt_clients_empty'))
+        return
+    kbd = [[InlineKeyboardButton(text=f"❌ {db.get_client_display_name(c)}", callback_data=f"delclient_{c['id']}")] for c in clients]
+    kbd.append([InlineKeyboardButton(text="🗑 Ҳаммині өшириў", callback_data="delclient_all")])
+    await message.answer(
+        await get_txt(message.from_user.id, 'zero_debt_clients_title', len(clients)),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kbd)
+    )
+
+@router.message(F.text == "🗑 Клиентти өшириў", DebtStates.ClientMenu)
+async def start_delete_client_from_card(message: Message, state: FSMContext):
+    if message.from_user.id != MAIN_ADMIN_ID: return
+    data = await state.get_data()
+    client_id = data.get('target_user_id')
+    client = await db.get_user_by_id(client_id)
+    if not client:
+        await message.answer(await get_txt(message.from_user.id, 'delete_client_not_found'))
+        return
+    if client['total_debt'] > 0:
+        await message.answer(await get_txt(message.from_user.id, 'delete_client_has_debt', client['total_debt']))
+        return
+    display_name = db.get_client_display_name(client)
+    await message.answer(
+        await get_txt(message.from_user.id, 'delete_client_confirm', display_name),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Иә", callback_data=f"delclient_confirm_{client_id}"),
+                InlineKeyboardButton(text="❌ Жоқ", callback_data="delclient_cancel")
+            ]
+        ]),
+        parse_mode="HTML"
+    )
+
+@router.callback_query(F.data.startswith("delclient_"))
+async def process_delete_client(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != MAIN_ADMIN_ID:
+        await callback.answer()
+        return
+
+    if callback.data == "delclient_cancel":
+        await callback.message.answer(await get_txt(callback.from_user.id, 'main_menu'), reply_markup=get_main_menu(callback.from_user.id))
+        await state.clear()
+        await callback.answer()
+        return
+
+    if callback.data == "delclient_all":
+        clients = await db.get_zero_debt_clients()
+        if not clients:
+            await callback.message.answer(await get_txt(callback.from_user.id, 'zero_debt_clients_empty'))
+            await callback.answer()
+            return
+        await callback.message.answer(
+            await get_txt(callback.from_user.id, 'delete_all_clients_confirm', len(clients)),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ Иә", callback_data="delclient_all_confirm"),
+                    InlineKeyboardButton(text="❌ Жоқ", callback_data="delclient_cancel")
+                ]
+            ])
+        )
+        await callback.answer()
+        return
+
+    if callback.data == "delclient_all_confirm":
+        deleted = await db.delete_all_zero_debt_clients()
+        await callback.message.answer(await get_txt(callback.from_user.id, 'delete_all_clients_success', deleted))
+        await state.clear()
+        await callback.answer()
+        return
+
+    if callback.data.startswith("delclient_confirm_"):
+        client_id = int(callback.data.split("_")[2])
+    else:
+        client_id = int(callback.data.split("_")[1])
+        client = await db.get_user_by_id(client_id)
+        if not client:
+            await callback.message.answer(await get_txt(callback.from_user.id, 'delete_client_not_found'))
+            await callback.answer()
+            return
+        display_name = db.get_client_display_name(client)
+        await callback.message.answer(
+            await get_txt(callback.from_user.id, 'delete_client_confirm', display_name),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ Иә", callback_data=f"delclient_confirm_{client_id}"),
+                    InlineKeyboardButton(text="❌ Жоқ", callback_data="delclient_cancel")
+                ]
+            ]),
+            parse_mode="HTML"
+        )
+        await callback.answer()
+        return
+
+    ok, reason = await db.delete_client_from_db(client_id)
+    if ok:
+        await callback.message.answer(await get_txt(callback.from_user.id, 'delete_client_success'))
+        await state.clear()
+    elif reason == "has_debt":
+        client = await db.get_user_by_id(client_id)
+        debt = client['total_debt'] if client else 0
+        await callback.message.answer(await get_txt(callback.from_user.id, 'delete_client_has_debt', debt))
+    elif reason == "client_not_found":
+        await callback.message.answer(await get_txt(callback.from_user.id, 'delete_client_not_found'))
+    else:
+        await callback.message.answer(await get_txt(callback.from_user.id, 'delete_client_forbidden'))
+    await callback.answer()
+
 @router.message(F.user_shared & (F.user_shared.request_id == 2))
-async def contact_select_client(message: Message, state: FSMContext):
+async def contact_select_client(message: Message, state: FSMContext, bot: Bot):
     is_seller = await db.is_user_seller(message.from_user.id)
     if message.from_user.id != MAIN_ADMIN_ID and not is_seller: return
     client_id = message.user_shared.user_id
-    client = await db.get_user_by_id(client_id)
+    client = await refresh_user_from_telegram(bot, client_id)
     if not client:
-        import aiosqlite
-        async with aiosqlite.connect(db.DB_PATH) as conn:
-            await conn.execute("INSERT OR IGNORE INTO Users (id, username, full_name) VALUES (?, ?, ?)", (client_id, "user", f"Клиент_{client_id}"))
-            await conn.commit()
-        client = await db.get_user_by_id(client_id)
-    await state.update_data(target_user_id=client_id, target_user_name=client['full_name'])
-    txt = await get_txt(message.from_user.id, 'client_card', client['full_name'], client['total_debt'])
-    await message.answer(txt, reply_markup=ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="🛍 Товар бериў"), KeyboardButton(text="💰 Қарзын қайтарыў")],
-        [KeyboardButton(text="📊 Қарз тарыхын көриў")],
-        [KeyboardButton(text="⬅️ Бас менюге қайтыў")]
-    ], resize_keyboard=True), parse_mode="HTML")
+        await db.upsert_user(client_id, "NoUsername", "")
+        client = await refresh_user_from_telegram(bot, client_id)
+    display_name = db.get_client_display_name(client)
+    await state.update_data(target_user_id=client_id, target_user_name=display_name)
+    txt = await get_txt(message.from_user.id, 'client_card', display_name, client['total_debt'])
+    await message.answer(txt, reply_markup=get_client_menu_keyboard(client, message.from_user.id), parse_mode="HTML")
     await state.set_state(DebtStates.ClientMenu)
 
 @router.message(F.text == "👥 Клиентлер")
-async def start_search(message: Message, state: FSMContext):
+async def start_search(message: Message, state: FSMContext, bot: Bot):
     is_seller = await db.is_user_seller(message.from_user.id)
     if message.from_user.id != MAIN_ADMIN_ID and not is_seller: return
     await state.set_state(DebtStates.SearchName)
     await state.update_data(current_page=1, current_search="")
-    inline_markup, total_pages = await get_clients_pagination_keyboard(page=1)
+    inline_markup, total_pages = await get_clients_pagination_keyboard(page=1, bot=bot)
     if not inline_markup:
-        await message.answer("Базада ҳеш қандай клиент табылмады.", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ Бас менюге қайтыў")]], resize_keyboard=True))
+        await message.answer(await get_txt(message.from_user.id, 'no_active_clients'), reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ Бас менюге қайтыў")]], resize_keyboard=True))
         return
     search_txt = await get_txt(message.from_user.id, 'search_client')
     await message.answer(f"{search_txt}\n\n📖 Страница: 1/{total_pages}", reply_markup=inline_markup)
     await message.answer("Текст арқалы излеў ушын атын жазың ямаса төмендеги дизимнен сайлаң:", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ Бас менюге қайтыў")]], resize_keyboard=True))
 
 @router.callback_query(F.data.startswith("clipage_"), DebtStates.SearchName)
-async def process_client_page(callback: CallbackQuery, state: FSMContext):
+async def process_client_page(callback: CallbackQuery, state: FSMContext, bot: Bot):
     page = int(callback.data.split("_")[1])
     data = await state.get_data()
     search_query = data.get("current_search", "")
     await state.update_data(current_page=page)
-    inline_markup, total_pages = await get_clients_pagination_keyboard(page=page, search_query=search_query)
+    inline_markup, total_pages = await get_clients_pagination_keyboard(page=page, search_query=search_query, bot=bot)
     if inline_markup:
         await callback.message.edit_text(f"Клиентлер дизими:\n\n📖 Страница: {page}/{total_pages}", reply_markup=inline_markup)
     await callback.answer()
 
 @router.message(DebtStates.SearchName)
-async def process_search_name(message: Message, state: FSMContext):
-    search_text = message.text.strip()
+async def process_search_name(message: Message, state: FSMContext, bot: Bot):
+    search_text = message.text.strip().lstrip('@')
     if search_text == "⬅️ Бас менюге қайтыў":
         await state.clear()
         return
     await state.update_data(current_page=1, current_search=search_text)
-    inline_markup, total_pages = await get_clients_pagination_keyboard(page=1, search_query=search_text)
+    inline_markup, total_pages = await get_clients_pagination_keyboard(page=1, search_query=search_text, bot=bot)
     if not inline_markup:
         await message.answer(await get_txt(message.from_user.id, 'client_not_found'))
         return
     await message.answer(f"Табылған клиентлер (Результаты поиска):\n\n📖 Страница: 1/{total_pages}", reply_markup=inline_markup)
 
 @router.callback_query(F.data.startswith("cli_"), DebtStates.SearchName)
-async def select_client_callback(callback: CallbackQuery, state: FSMContext):
+async def select_client_callback(callback: CallbackQuery, state: FSMContext, bot: Bot):
     client_id = int(callback.data.split("_")[1])
-    client = await db.get_user_by_id(client_id)
-    await state.update_data(target_user_id=client_id, target_user_name=client['full_name'])
-    txt = await get_txt(callback.from_user.id, 'client_card', client['full_name'], client['total_debt'])
-    await callback.message.answer(txt, reply_markup=ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="🛍 Товар бериў"), KeyboardButton(text="💰 Қарзын қайтарыў")],
-        [KeyboardButton(text="📊 Қарз тарыхын көриў")],
-        [KeyboardButton(text="⬅️ Бас менюге қайтыў")]
-    ], resize_keyboard=True), parse_mode="HTML")
+    client = await refresh_user_from_telegram(bot, client_id)
+    display_name = db.get_client_display_name(client)
+    await state.update_data(target_user_id=client_id, target_user_name=display_name)
+    txt = await get_txt(callback.from_user.id, 'client_card', display_name, client['total_debt'])
+    await callback.message.answer(txt, reply_markup=get_client_menu_keyboard(client, callback.from_user.id), parse_mode="HTML")
     await state.set_state(DebtStates.ClientMenu)
     await callback.answer()
 

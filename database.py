@@ -1,9 +1,28 @@
 import aiosqlite
 import sqlite3
 
-from django import db
-from config import DB_PATH
+from config import DB_PATH, MAIN_ADMIN_ID
 from datetime import datetime, timedelta
+
+def is_real_username(username) -> bool:
+    return bool(username) and username not in ('NoUsername', 'user')
+
+def is_placeholder_name(name) -> bool:
+    if not name:
+        return True
+    return name.startswith('Клиент_') or name.startswith('Админ_') or name.startswith('User_')
+
+def get_client_display_name(user: dict) -> str:
+    username = user.get('username') or ''
+    if is_real_username(username):
+        return f"@{username}"
+    full_name = user.get('full_name') or ''
+    if full_name and not is_placeholder_name(full_name):
+        return full_name
+    return f"@{username}" if username else f"ID {user['id']}"
+
+def needs_profile_refresh(user: dict) -> bool:
+    return not is_real_username(user.get('username')) or is_placeholder_name(user.get('full_name'))
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -18,6 +37,30 @@ async def get_user_by_id(user_id: int):
         async with db.execute("SELECT * FROM Users WHERE id = ?", (user_id,)) as cursor:
             row = await cursor.fetchone()
             return dict(row) if row else None
+
+async def upsert_user(user_id: int, username: str, full_name: str):
+    username = username or "NoUsername"
+    full_name = full_name or ""
+    existing = await get_user_by_id(user_id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        if not existing:
+            await db.execute(
+                "INSERT INTO Users (id, username, full_name) VALUES (?, ?, ?)",
+                (user_id, username, full_name)
+            )
+        else:
+            new_username = username if is_real_username(username) else existing['username']
+            if is_placeholder_name(existing['full_name']):
+                new_full_name = full_name if full_name and not is_placeholder_name(full_name) else existing['full_name']
+            elif full_name and not is_placeholder_name(full_name):
+                new_full_name = full_name
+            else:
+                new_full_name = existing['full_name']
+            await db.execute(
+                "UPDATE Users SET username = ?, full_name = ? WHERE id = ?",
+                (new_username, new_full_name, user_id)
+            )
+        await db.commit()
 
 async def set_user_lang(user_id: int, lang: str):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -98,11 +141,55 @@ async def is_user_seller(user_id: int) -> bool:
             row = await cursor.fetchone()
             return row is not None
 
-async def search_users_by_name(name: str):
+async def search_users_by_name(name: str, only_with_debt: bool = True):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM Users WHERE full_name LIKE ?", (f"%{name}%",)) as cursor:
+        search = f"%{name}%"
+        query = (
+            "SELECT * FROM Users WHERE (full_name LIKE ? OR username LIKE ?) AND id != ? "
+            "AND id NOT IN (SELECT id FROM StoreSellers)"
+        )
+        params = [search, search, MAIN_ADMIN_ID]
+        if only_with_debt:
+            query += " AND total_debt > 0"
+        query += " ORDER BY username, full_name"
+        async with db.execute(query, params) as cursor:
             return [dict(row) for row in await cursor.fetchall()]
+
+async def get_zero_debt_clients():
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        query = (
+            "SELECT * FROM Users WHERE total_debt <= 0 AND id != ? "
+            "AND id NOT IN (SELECT id FROM StoreSellers) ORDER BY username, full_name"
+        )
+        async with db.execute(query, (MAIN_ADMIN_ID,)) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
+
+async def delete_client_from_db(user_id: int):
+    if user_id == MAIN_ADMIN_ID:
+        return False, "cannot_delete_admin"
+    if await is_user_seller(user_id):
+        return False, "cannot_delete_seller"
+    user = await get_user_by_id(user_id)
+    if not user:
+        return False, "client_not_found"
+    if user['total_debt'] > 0:
+        return False, "has_debt"
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM Invoices WHERE user_id = ?", (user_id,))
+        await db.execute("DELETE FROM Users WHERE id = ?", (user_id,))
+        await db.commit()
+    return True, "deleted"
+
+async def delete_all_zero_debt_clients():
+    clients = await get_zero_debt_clients()
+    deleted = 0
+    for client in clients:
+        ok, _ = await delete_client_from_db(client['id'])
+        if ok:
+            deleted += 1
+    return deleted
 
 def get_all_invoices_sync():
     import sqlite3
